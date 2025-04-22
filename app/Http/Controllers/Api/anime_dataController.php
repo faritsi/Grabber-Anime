@@ -14,6 +14,9 @@ use App\Http\Resources\DataResource;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use App\Jobs\GrabAnimeDataJob;
 
 class anime_dataController extends Controller
 {
@@ -154,7 +157,7 @@ class anime_dataController extends Controller
     public function grabberIndex()
     {
         $animeData = anime_data::with([
-            'image',
+            // 'image_url',
             'trailer',
             'producer',
             'studio',
@@ -165,108 +168,119 @@ class anime_dataController extends Controller
         return new DataResource(true, 'List Anime dari Grabber', $animeData);
     }
 
-    public function bulkGrabber()
+    public function Maling()
     {
-        $inserted = [];
-        $skipped = [];
-        $limit = 20;
-        $max = 1000;
+        ini_set('max_execution_time', 0); // unlimited time
 
-        try {
-            for ($page = 1; $page <= ceil($max / $limit); $page++) {
-                $response = Http::retry(3, 200)
-                    ->timeout(10)
-                    ->get("https://api.jikan.moe/v4/anime", [
-                        'limit' => $limit,
-                        'page' => $page,
-                        'order_by' => 'popularity',
-                        'sort' => 'desc'
-                    ]);
+        $maxRequests = 1000;
+        $delaySeconds = 1; // jeda antar batch
+        $batchSize = 15;
 
-                if (!$response->successful() || !isset($response['data'])) {
-                    break;
-                }
+        $mal_id = 1;
+        $grabbed = 0;
 
-                foreach ($response['data'] as $anime) {
-                    if (anime_data::where('mal_id', $anime['mal_id'])->exists()) {
-                        $skipped[] = $anime['title'];
+        while ($grabbed < $maxRequests) {
+            for ($i = 0; $i < $batchSize && $grabbed < $maxRequests; $i++) {
+                try {
+                    $response = Http::timeout(10)->get("https://api.jikan.moe/v4/anime/{$mal_id}");
+
+                    if (!$response->successful() || !isset($response['data'])) {
+                        Log::warning("Gagal ambil data mal_id {$mal_id}: " . $response->status());
+                        $mal_id++;
                         continue;
                     }
 
-                    $image = anime_image::create([
-                        'image_url' => $anime['images']['jpg']['image_url'] ?? 'default.jpg'
+                    $anime = $response['data'];
+
+                    // Cek duplikat
+                    $existing = anime_data::where('judul', $anime['title'])
+                        ->where('tahun_rilis', $anime['year'] ?? now()->year)
+                        ->first();
+
+                    if ($existing) {
+                        $mal_id++;
+                        continue;
+                    }
+
+                    DB::beginTransaction();
+
+                    $animeImage = anime_image::create([
+                        'image_url' => $anime['images']['jpg']['large_image_url'] ?? ''
                     ]);
 
-                    $trailer = anime_trailer::create([
+                    $animeTrailer = anime_trailer::create([
                         'trailer_url' => $anime['trailer']['url'] ?? 'https://youtube.com'
                     ]);
 
-                    $producer = anime_producer::firstOrCreate([
+                    $animeProducer = anime_producer::create([
                         'nama_produser' => $anime['producers'][0]['name'] ?? 'Unknown'
                     ]);
 
-                    $studio = anime_studio::firstOrCreate([
+                    $animeStudio = anime_studio::create([
                         'nama_studio' => $anime['studios'][0]['name'] ?? 'Unknown'
                     ]);
 
-                    $data = anime_data::create([
-                        'mal_id' => $anime['mal_id'],
+                    $animeData = anime_data::create([
                         'url' => $anime['url'],
-                        'anime_image_id' => $image->id,
+                        'anime_image_id' => $animeImage->id,
                         'judul' => $anime['title'],
                         'judul_inggris' => $anime['title_english'] ?? $anime['title'],
-                        'judul_jepang' => $anime['title_japanese'] ?? '-',
-                        'tipe' => $anime['type'] ?? 'TV',
-                        'source' => $anime['source'] ?? 'Unknown',
+                        'judul_jepang' => $anime['title_japanese'] ?? $anime['title'],
+                        'tipe' => $anime['type'],
+                        'source' => $anime['source'],
                         'episode' => $anime['episodes'] ?? 0,
-                        'status' => $anime['status'] ?? 'Unknown',
-                        'durasi' => $anime['duration'] ?? '-',
-                        'rating' => $anime['score'] ?? 'N/A',
-                        'sinopsis' => $anime['synopsis'] ?? 'Tidak ada sinopsis.',
+                        'status' => $anime['status'],
+                        'durasi' => $anime['duration'],
+                        'rating' => $anime['score'] ?? 0,
+                        'sinopsis' => $anime['synopsis'],
                         'season' => ucfirst($anime['season'] ?? 'Unknown'),
-                        'tahun_rilis' => $anime['year'] ?? 0,
-                        'anime_trailer_id' => $trailer->id,
-                        'anime_produser_id' => $producer->id,
-                        'anime_studio_id' => $studio->id,
+                        'tahun_rilis' => $anime['year'] ?? now()->year,
+                        'anime_trailer_id' => $animeTrailer->id,
+                        'anime_produser_id' => $animeProducer->id,
+                        'anime_studio_id' => $animeStudio->id,
                     ]);
 
-                    if (!empty($anime['genres'])) {
-                        foreach ($anime['genres'] as $genre) {
-                            $genreModel = anime_genre::firstOrCreate([
-                                'nama_genre' => $genre['name']
-                            ]);
-                            $data->genres()->syncWithoutDetaching([$genreModel->id]);
-                        }
+                    // Genre (many-to-many)
+                    foreach ($anime['genres'] as $genre) {
+                        $genreModel = anime_genre::firstOrCreate([
+                            'nama_genre' => $genre['name']
+                        ]);
+                        $animeData->genres()->attach($genreModel->id);
                     }
 
-                    $inserted[] = $data;
-
-                    // Stop jika sudah mencapai 1000
-                    if (count($inserted) >= $max) {
-                        break 2;
-                    }
+                    DB::commit();
+                    $grabbed++;
+                } catch (\Exception $e) {
+                    DB::rollBack();
+                    Log::error("Error di mal_id {$mal_id}: " . $e->getMessage());
                 }
 
-                // Delay 1 detik antar request
-                sleep(1);
+                $mal_id++;
             }
 
-            return response()->json([
-                'success' => true,
-                'message' => count($inserted) . ' anime berhasil di-grab. ' . count($skipped) . ' dilewati.',
-                'inserted_count' => count($inserted),
-                'skipped_titles' => $skipped
-            ]);
-
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Terjadi error saat ambil data dari Jikan API.',
-                'error' => $e->getMessage()
-            ], 500);
+            sleep($delaySeconds); // jeda antar batch
         }
+
+        return response()->json([
+            'status' => true,
+            'message' => "Selesai grab {$grabbed} anime dari Jikan API."
+        ]);
     }
 
+    public function grabQueue()
+    {
+        $max = 1000;
+        $start = 1;
+    
+        for ($mal_id = $start; $mal_id < $start + $max; $mal_id++) {
+            GrabAnimeDataJob::dispatch($mal_id)->onQueue('anime');
+        }
+    
+        return response()->json([
+            'message' => 'Proses grab data anime sedang dijalankan di background (queue)',
+            'status' => true
+        ]);
+    }
 
     // public function bulkGrabber()
     // {
