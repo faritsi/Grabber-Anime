@@ -8,6 +8,8 @@ Route::get('/anime/grabber/{mal_id}', [anime_dataController::class, 'grabber']);
 Route::get('/anime/grabber', [anime_dataController::class, 'grabberIndex']);
 Route::get('/anime/grabber/bulk', [anime_dataController::class, 'bulkGrabber']);
 Route::get('/anime/maling', [anime_dataController::class, 'Maling']);
+Route::get('/anime/all', [anime_dataController::class, 'index']);
+Route::get('/anime/{id}', [anime_dataController::class, 'show']);
 
 
 /*
